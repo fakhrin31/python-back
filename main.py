@@ -1,8 +1,11 @@
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Header, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
-from typing import List, Optional, Callable
+from typing import List, Optional
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
+from db import users_collection, tasks_collection
 
 # HTTPException → Untuk menangani error dengan kode status HTTP.
 # Request → Untuk menangani request HTTP dalam middleware.
@@ -10,6 +13,8 @@ from typing import List, Optional, Callable
 # JSONResponse → Untuk mengembalikan respons dalam format JSON.
 # BaseModel dan EmailStr dari pydantic → Untuk validasi data input.
 # List, Optional dari typing → Untuk menentukan tipe data dalam list dan parameter opsional.
+# motor, driver untuk asinkron dengan mongodb.
+# ObjectId, mengubah id menjadi objectid agar bisa disimpan di mongodb.
 
 app = FastAPI()
 
@@ -24,44 +29,21 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     return response
 
-# middleware local
-# async def local_middleware(request: Request, call_next):
-#     print(f"Local middleware executed for: {request.url.path}")
-#     response = await call_next(request)
-#     return response
-
 # Model untuk User
 class User(BaseModel):
-    id: int
     name: str
     email: EmailStr
     password: str
     role: str
     isActived: bool = True
-class UserBody(BaseModel):
-    name: str
-    email: EmailStr
-    password: str
-    role: str
-    isActived: Optional[bool] = True
 
 # Model untuk Task
 class Task(BaseModel):
-    id: float
     title: str
     description: str
-    user_id: float
+    user_id: str
     completed: bool = False
-
-class TaskBody(BaseModel):
-    title: str
-    description: str
-    user_id: float
-    completed: Optional[bool] = False
-
-users = []
-tasks = []
-
+    
 # {Users}
 # id (wajib) (primary key)
 # name (varchar)
@@ -86,123 +68,135 @@ def add_numbers(a: float, b: float):
     result = a + b
     return {"a": a, "b": b, "sum": result}
 
-# users route
+# @app.get("/test-mongo")
+# async def test_mongo():
+#     try:
+#         await db.command("ping")
+#         return {"message": "MongoDB Connected!"}
+#     except Exception as e:
+#         return {"error": str(e)}
 
+# -------------------------
+# CRUD Users dengan MongoDB
+# -------------------------
 @app.get("/users")
-def get_users():
-    return {
-        "success": True,
-        "status": 200,
-        "data": users
-    }
-    
-@app.get("/users/{user_id}", response_model=User)
-def get_user(user_id: float):
+async def get_users():
+    users = await users_collection.find().to_list(100)
     for user in users:
-        if user["id"] == user_id:
-            return user
+        user["_id"] = str(user["_id"])  # Ubah ObjectId ke string
+    return users
+
+@app.get("/users/{user_id}")
+async def get_user(user_id: str):
+    user = await users_collection.find_one({"_id": ObjectId(user_id)})
     #menangani kesalahan dengan mengembalikan respons HTTP dengan status 404 (Not Found) ketika data yang diminta tidak ditemukan.
-    #raise - menghentikan eksekusi
-    raise HTTPException(status_code=404, detail="User not found")
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found") #raise - menghentikan eksekusi
+    
+    user["_id"] = str(user["_id"])  # Konversi `_id` ke string
+    return user
 
-@app.post("/users")
-def create_user(body: UserBody):
-    # Validasi jika email sudah digunakan
-    for existing_user in users:
-        if existing_user['email'] == body.email:
-            return JSONResponse(status_code=400, content={
-                "success": False,
-                "status": 400,
-                "message": "Email already exists",
-            })
 
-    # Tambahkan user baru dengan ID unik
+@app.post("/users", status_code=201)
+async def create_user(body: User):
+    existing_user = await users_collection.find_one({"email": body.email})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already exists")
+    
     new_user = body.dict()
-    now = datetime.now()
-    new_user['id'] = now.timestamp() # pakai timestamp
-    users.append(new_user)
-    return {
-        "success": True,
-        "status": 201,
-        "message": "User created successfully",
-    }
+    new_user["_id"] = ObjectId()  # membuat _id ObjectId agar bisa disimpan ke mongodb
+
+    await users_collection.insert_one(new_user)
+    
+    # Konversi `_id` ke string agar bisa dikembalikan dalam response JSON
+    new_user["_id"] = str(new_user["_id"])
+    
+    return {"message": "User created successfully", "user": new_user}
 
 @app.put("/users/{user_id}")
-def update_user(user_id: float, body: UserBody):
-    for user in users:
-        if user["id"] == user_id:
-            user.update(body.dict())
-            return {"message": "User updated successfully", "user": user}
-    raise HTTPException(status_code=404, detail="User not found")
+async def update_user(user_id: str, body: User):
+    result = await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": body.dict()})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "User updated successfully"}
 
 @app.patch("/users/{user_id}/deactivate")
-def deactivate_user(user_id: float):
-    for user in users:
-        if user["id"] == user_id:
-            user["isActived"] = False
-            return {"message": "User deactivated successfully", "user": user}
-    raise HTTPException(status_code=404, detail="User not found")
+async def complete_user(user_id: str):
+    result = await users_collection.update_one({"_id": ObjectId(user_id)}, {"$set": {"isActived": False}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "User is Deactivated"}
+
 
 @app.delete("/users/{user_id}")
-def delete_user(user_id: float):
-    global users
-    for user in users:
-        if user["id"] == user_id:
-            users.remove(user)
-            return {"message": "User deleted successfully"}
-    raise HTTPException(status_code=404, detail="User not found")
+async def delete_user(user_id: str):
+    result = await users_collection.delete_one({"_id": ObjectId(user_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "User deleted successfully"}
 
-# Task Routes
-# @app.get("/tasks", response_model=List[Task])
-# async def get_tasks(request: Request, middleware=Depends(local_middleware)):
-#     return tasks
+# -------------------------
+# CRUD Tasks dengan MongoDB
+# -------------------------
 
-@app.get("/tasks", response_model=List[Task])
-def get_tasks():
+@app.get("/tasks")
+async def get_tasks():
+    tasks = await tasks_collection.find().to_list(100) #fungsi untuk mencari semua data dalam list
+    for task in tasks:
+        task["_id"] = str(task["_id"])  # Ubah ObjectId ke string agar dapat ditampilkan
     return tasks
 
-@app.get("/tasks/{task_id}", response_model=Task)
-def get_task(task_id: float):
-    for task in tasks:
-        if task["id"] == task_id:
-            return task
-    raise HTTPException(status_code=404, detail="Task not found")
+@app.get("/tasks/user/{user_id}")
+async def get_tasks_by_user(user_id: str):
+    try:
+        #mencari semua data tasks berdasarkan user_id dalam format ObjectId
+        user_tasks = await tasks_collection.find({"user_id": user_id}).to_list(100)
+
+        if not user_tasks:
+            raise HTTPException(status_code=404, detail="No tasks found for this user")
+
+        # Konversi _id dari ObjectId ke string sebelum dikembalikan
+        for task in user_tasks:
+            task["_id"] = str(task["_id"])
+
+        return user_tasks
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/tasks", status_code=201)
-def create_task(body: TaskBody):
-    for user in users:
-        if user["id"] == body.user_id:
-            new_task = body.dict()
-            new_task["id"] = datetime.now().timestamp()
-            tasks.append(new_task)
-            return {"message": "Task created successfully", "task": new_task}
-    raise HTTPException(status_code=400, detail="Invalid user ID")
+async def create_task(body: Task):
+    new_task = body.dict()
+    new_task["_id"] = ObjectId()  # membuat _id menjadi ObjectId agar bisa disimpan ke mongodb
+
+    await tasks_collection.insert_one(new_task)     
+    
+    # Konversi `_id` ke string agar bisa dikembalikan dalam response JSON
+    new_task["_id"] = str(new_task["_id"])
+    
+    return {"message": "Task created successfully", "task": new_task}
 
 @app.put("/tasks/{task_id}")
-def update_task(task_id: float, body: TaskBody):
-    for task in tasks:
-        if task["id"] == task_id:
-            task.update(body.dict())
-            return {"message": "Task updated successfully", "task": task}
-    raise HTTPException(status_code=404, detail="Task not found")
+async def update_task(task_id: str, body: Task):
+    #mencari semua data tasks berdasarkan user_id dalam format ObjectId
+    result = await tasks_collection.update_one({"_id": ObjectId(task_id)}, {"$set": body.dict()})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"message": "Task updated successfully"}
 
 @app.patch("/tasks/{task_id}/complete")
-def complete_task(task_id: float):
-    for task in tasks:
-        if task["id"] == task_id:
-            task["completed"] = True
-            return {"message": "Task marked as completed", "task": task}
-    raise HTTPException(status_code=404, detail="Task not found")
+async def complete_task(task_id: str):
+    result = await tasks_collection.update_one({"_id": ObjectId(task_id)}, {"$set": {"completed": True}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"message": "Task marked as completed"}
 
 @app.delete("/tasks/{task_id}")
-def delete_task(task_id: float):
-    global tasks
-    for task in tasks:
-        if task["id"] == task_id:
-            tasks.remove(task)
-            return {"message": "Task deleted successfully"}
-    raise HTTPException(status_code=404, detail="Task not found")
-
+async def delete_task(task_id: str):
+    result = await tasks_collection.delete_one({"_id": ObjectId(task_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"message": "Task deleted successfully"}
 
 if __name__ == "__main__":
     import uvicorn
